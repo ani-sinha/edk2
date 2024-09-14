@@ -38,6 +38,45 @@ typedef struct {
 } KERNEL_VENMEDIA_FILE_DEVPATH;
 #pragma pack ()
 
+#define MAX_VMFWUPD_ENTRIES 256
+typedef enum {
+  VMFW_TYPE_BLOB_KERNEL = 0x01, /* kernel */
+  VMFW_TYPE_BLOB_SETUP,         /* need to check if this is required */
+  VMFW_TYPE_BLOB_INITRD,        /* initrd */
+  VMFW_TYPE_BLOB_CMDLINE,       /* command line */
+  VMFW_TYPE_BLOB_FW,            /* firmware */
+  VMFW_TYPE_BLOB_MAX
+} blob_type_t;
+
+typedef struct {
+  /*
+   * blob_type indicates the type of blob/launch digest the guest has passed
+   * to the host. blob_type 0x00 is invalid. It is of type blob_type_t.
+   */
+  UINT8 blob_type;
+  /*
+   * map_type: type of guest memory mapping requested. Mappings can be either
+   * private or shared. Private guest pages are flipped from shared to private
+   * when a new SEV guest context is created. The private memory contains CPU
+   * state information and firmware blob. The shared memory remains shared
+   * with the hypervisor and is excluded from encryption and measurements.
+   * The shared data is the next stage artifacts (kernel image/UKI, initrd,
+   * command line) that are validated by the second stage firmware present in
+   * the private memory. Thus they need not be explicitly measured by ASP.
+   */
+  UINT8 map_type;
+  UINT32 size;         /* size of the blob */
+  UINT64 paddr;        /* starting gpa where the blob is in guest memory. We may
+			* copy the contents of the guest private memory to a
+			* different addresss from paddr
+			*/
+  UINT64 target_paddr; /* guest physical address where private blobs are
+			* copied to.
+			* XXX: Is this really required to be passed from
+			* the guest?
+			*/
+} FwCfgVmFwUpdateBlob;
+
 STATIC CONST KERNEL_VENMEDIA_FILE_DEVPATH  mKernelDevicePath = {
   {
     {
@@ -92,6 +131,143 @@ FreeLegacyImage (
   }
 }
 
+
+STATIC
+EFI_STATUS
+QemuLoadBlobFwUpdate (
+  OUT EFI_HANDLE  *ImageHandle
+  )
+{
+  EFI_STATUS          Status;
+  FwCfgVmFwUpdateBlob blobs[MAX_VMFWUPD_ENTRIES];
+  FwCfgVmFwUpdateBlob *blob, *kernel_blob = NULL, *setup_blob = NULL;
+  FwCfgVmFwUpdateBlob *initrd_blob = NULL, *cmdline_blob = NULL;
+  OVMF_LOADED_X86_LINUX_KERNEL  *LoadedImage;
+  UINTN                         KernelSize;
+  UINTN                         SetupSize;
+  int i;
+  FIRMWARE_CONFIG_ITEM FwCfgItem;
+  UINTN FwCfgSize;
+
+  if (QemuFwCfgFindFile("etc/vmfwupdate-blob", &FwCfgItem, &FwCfgSize) != EFI_SUCCESS) {
+    DEBUG ((DEBUG_ERROR, "Could not find vmfwupdate-blob!\n"));
+    return EFI_NOT_FOUND;
+  }
+
+  QemuFwCfgSelectItem(FwCfgItem);
+  QemuFwCfgReadBytes(sizeof(blobs), blobs);
+
+  for (i=0; i<MAX_VMFWUPD_ENTRIES; i++) {
+    blob = &blobs[i];
+    // first null entry terminates the processing loop
+    if (!blob->blob_type) {
+      break;
+    }
+    switch(blob->blob_type) {
+    case VMFW_TYPE_BLOB_KERNEL:
+      kernel_blob = blob;
+      break;
+    case VMFW_TYPE_BLOB_SETUP:
+      setup_blob = blob;
+      break;
+    case VMFW_TYPE_BLOB_INITRD:
+      /* initrd */
+      initrd_blob = blob;
+      break;
+    case VMFW_TYPE_BLOB_CMDLINE:
+      // process command line
+      cmdline_blob = blob;
+      break;
+    default:
+      DEBUG ((DEBUG_ERROR, "blob type %d cannot be processed!\n",
+	      blob->blob_type));
+      return EFI_UNSUPPORTED;
+    }
+  }
+
+  if (!kernel_blob || !setup_blob) {
+    DEBUG ((DEBUG_INFO, "no kernel or setup blobs passed!.\n"));
+    return EFI_NOT_FOUND;
+  }
+  KernelSize = (UINTN)kernel_blob->size;
+  SetupSize =  (UINTN)setup_blob->size;
+  if ((KernelSize == 0) || (SetupSize == 0)) {
+    DEBUG ((DEBUG_INFO, "kernel size 0 passed.\n"));
+    return EFI_NOT_FOUND;
+  }
+
+  LoadedImage = AllocateZeroPool (sizeof (*LoadedImage));
+  if (LoadedImage == NULL) {
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  LoadedImage->SetupSize = setup_blob->size;
+  LoadedImage->SetupBuf = (void*) setup_blob->paddr;
+  Status = LoadLinuxCheckKernelSetup (
+	     LoadedImage->SetupBuf,
+             LoadedImage->SetupSize
+	     );
+  if (EFI_ERROR (Status)) {
+    goto end;
+  }
+
+  Status = LoadLinuxInitializeKernelSetup (LoadedImage->SetupBuf);
+  if (EFI_ERROR (Status)) {
+    goto end;
+  }
+
+  LoadedImage->KernelInitialSize = LoadLinuxGetKernelSize (
+                                     LoadedImage->SetupBuf,
+                                     KernelSize
+                                     );
+  if (LoadedImage->KernelInitialSize == 0) {
+    Status = EFI_UNSUPPORTED;
+    goto end;
+  }
+
+  LoadedImage->KernelBuf = (void*) kernel_blob->paddr;
+
+  if (cmdline_blob) {
+    LoadedImage->CommandLineSize = cmdline_blob->size;
+    LoadedImage->CommandLine = (void*) cmdline_blob->paddr;
+  }
+
+  Status = LoadLinuxSetCommandLine (
+	    LoadedImage->SetupBuf,
+            LoadedImage->CommandLine
+	    );
+  if (EFI_ERROR (Status)) {
+    goto end;
+  }
+
+  if (initrd_blob) {
+    LoadedImage->InitrdSize = (UINTN)initrd_blob->size;
+    LoadedImage->InitrdData = (void*) initrd_blob->paddr;
+  }
+
+  Status = LoadLinuxSetInitrd (
+             LoadedImage->SetupBuf,
+             LoadedImage->InitrdData,
+             LoadedImage->InitrdSize
+             );
+  if (EFI_ERROR (Status)) {
+    goto end;
+  }
+
+  *ImageHandle = NULL;
+  Status       = gBS->InstallProtocolInterface (
+                        ImageHandle,
+                        &gOvmfLoadedX86LinuxKernelProtocolGuid,
+                        EFI_NATIVE_INTERFACE,
+                        LoadedImage
+                        );
+
+  return EFI_SUCCESS;
+ end:
+  FreePool (LoadedImage);
+  return Status;
+}
+
 STATIC
 EFI_STATUS
 QemuLoadLegacyImage (
@@ -102,6 +278,14 @@ QemuLoadLegacyImage (
   UINTN                         KernelSize;
   UINTN                         SetupSize;
   OVMF_LOADED_X86_LINUX_KERNEL  *LoadedImage;
+
+  Status = QemuLoadBlobFwUpdate(ImageHandle);
+  if (Status == EFI_SUCCESS) {
+    return Status;
+  } else {
+    DEBUG ((DEBUG_INFO, "Unable to load kernel from fwupd blobs, "
+	    "falling back to legacy.\n"));
+  }
 
   QemuFwCfgSelectItem (QemuFwCfgItemKernelSize);
   KernelSize = (UINTN)QemuFwCfgRead32 ();
@@ -345,6 +529,20 @@ QemuLoadKernelImage (
   //
   CommandLine = NULL;
 
+  // try using legacy path first
+  Status = QemuLoadLegacyImage (&KernelImageHandle);
+  if (!EFI_ERROR (Status)) {
+      *ImageHandle = KernelImageHandle;
+      return EFI_SUCCESS;
+  }
+  else {
+        DEBUG ((
+          DEBUG_ERROR,
+          "%a: QemuLoadLegacyImage(): %r\n",
+          __func__,
+          Status
+          ));
+  }
   //
   // Load the image. This should call back into the QEMU EFI loader file system.
   //
@@ -385,24 +583,6 @@ QemuLoadKernelImage (
     // Fall through
     //
     case EFI_UNSUPPORTED:
-      //
-      // The image is not natively supported or cross-type supported. Let's try
-      // loading it using the loader that parses the bzImage metadata directly.
-      //
-      Status = QemuLoadLegacyImage (&KernelImageHandle);
-      if (EFI_ERROR (Status)) {
-        DEBUG ((
-          DEBUG_ERROR,
-          "%a: QemuLoadLegacyImage(): %r\n",
-          __func__,
-          Status
-          ));
-        return Status;
-      }
-
-      *ImageHandle = KernelImageHandle;
-      return EFI_SUCCESS;
-
     default:
       DEBUG ((DEBUG_ERROR, "%a: LoadImage(): %r\n", __func__, Status));
       return Status;
