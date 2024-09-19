@@ -518,6 +518,7 @@ QemuLoadKernelImage (
   )
 {
   EFI_STATUS                 Status;
+  EFI_STATUS                 LegacyStatus;
   EFI_HANDLE                 KernelImageHandle;
   EFI_LOADED_IMAGE_PROTOCOL  *KernelLoadedImage;
   UINTN                      CommandLineSize;
@@ -536,12 +537,13 @@ QemuLoadKernelImage (
       return EFI_SUCCESS;
   }
   else {
-        DEBUG ((
-          DEBUG_ERROR,
-          "%a: QemuLoadLegacyImage(): %r\n",
-          __func__,
-          Status
-          ));
+    LegacyStatus = Status;
+    DEBUG ((
+	    DEBUG_ERROR,
+	    "%a: QemuLoadLegacyImage(): %r\n",
+	    __func__,
+	    Status
+	    ));
   }
   //
   // Load the image. This should call back into the QEMU EFI loader file system.
@@ -583,6 +585,8 @@ QemuLoadKernelImage (
     // Fall through
     //
     case EFI_UNSUPPORTED:
+      // we handle legacy case first thing. So no need to retry legacy loader
+      return LegacyStatus;
     default:
       DEBUG ((DEBUG_ERROR, "%a: LoadImage(): %r\n", __func__, Status));
       return Status;
