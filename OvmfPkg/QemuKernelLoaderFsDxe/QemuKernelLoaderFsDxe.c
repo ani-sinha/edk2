@@ -28,6 +28,45 @@
 #include <Protocol/LoadFile2.h>
 #include <Protocol/SimpleFileSystem.h>
 
+#define MAX_VMFWUPD_ENTRIES 256
+typedef enum {
+  VMFW_TYPE_BLOB_KERNEL = 0x01, /* kernel */
+  VMFW_TYPE_BLOB_SETUP,         /* need to check if this is required */
+  VMFW_TYPE_BLOB_INITRD,        /* initrd */
+  VMFW_TYPE_BLOB_CMDLINE,       /* command line */
+  VMFW_TYPE_BLOB_FW,            /* firmware */
+  VMFW_TYPE_BLOB_MAX
+} blob_type_t;
+
+typedef struct {
+  /*
+   * blob_type indicates the type of blob/launch digest the guest has passed
+   * to the host. blob_type 0x00 is invalid. It is of type blob_type_t.
+   */
+  UINT8 blob_type;
+  /*
+   * map_type: type of guest memory mapping requested. Mappings can be either
+   * private or shared. Private guest pages are flipped from shared to private
+   * when a new SEV guest context is created. The private memory contains CPU
+   * state information and firmware blob. The shared memory remains shared
+   * with the hypervisor and is excluded from encryption and measurements.
+   * The shared data is the next stage artifacts (kernel image/UKI, initrd,
+   * command line) that are validated by the second stage firmware present in
+   * the private memory. Thus they need not be explicitly measured by ASP.
+   */
+  UINT8 map_type;
+  UINT32 size;         /* size of the blob */
+  UINT64 paddr;        /* starting gpa where the blob is in guest memory. We may
+			* copy the contents of the guest private memory to a
+			* different addresss from paddr
+			*/
+  UINT64 target_paddr; /* guest physical address where private blobs are
+			* copied to.
+			* XXX: Is this really required to be passed from
+			* the guest?
+			*/
+} FwCfgVmFwUpdateBlob;
+
 //
 // Static data that hosts the fw_cfg blobs and serves file requests.
 //
@@ -45,6 +84,7 @@ typedef struct {
     FIRMWARE_CONFIG_ITEM CONST    DataKey;
     UINT32                        Size;
   }                             FwCfgItem[2];
+  UINT32          VmFwIdx;
   UINT32          Size;
   UINT8           *Data;
 } KERNEL_BLOB;
@@ -55,17 +95,17 @@ STATIC KERNEL_BLOB  mKernelBlob[KernelBlobTypeMax] = {
     {
       { QemuFwCfgItemKernelSetupSize, QemuFwCfgItemKernelSetupData, },
       { QemuFwCfgItemKernelSize,      QemuFwCfgItemKernelData,      },
-    }
+    },VMFW_TYPE_BLOB_KERNEL
   },  {
     L"initrd",
     {
       { QemuFwCfgItemInitrdSize,      QemuFwCfgItemInitrdData,      },
-    }
+    }, VMFW_TYPE_BLOB_INITRD
   },  {
     L"cmdline",
     {
       { QemuFwCfgItemCommandLineSize, QemuFwCfgItemCommandLineData, },
-    }
+    }, VMFW_TYPE_BLOB_CMDLINE
   }
 };
 
@@ -920,6 +960,55 @@ STATIC CONST EFI_LOAD_FILE2_PROTOCOL  mInitrdLoadFile2 = {
 // Utility functions.
 //
 
+STATIC
+EFI_STATUS
+FetchVmFwBlob (
+  IN OUT KERNEL_BLOB  *Blob
+  )
+{
+  FwCfgVmFwUpdateBlob blobs[MAX_VMFWUPD_ENTRIES];
+  int i;
+  FIRMWARE_CONFIG_ITEM FwCfgItem;
+  UINTN FwCfgSize;
+  FwCfgVmFwUpdateBlob *blob;
+
+  DEBUG ((DEBUG_INFO, "XXX %a:%d\n", __func__, __LINE__));
+
+  /* TODO: Do outside of the blob loop */
+  if (QemuFwCfgFindFile("etc/vmfwupdate-blob", &FwCfgItem, &FwCfgSize) != EFI_SUCCESS) {
+    DEBUG ((DEBUG_ERROR, "Could not find vmfwupdate-blob!\n"));
+    return EFI_NOT_FOUND;
+  }
+
+  QemuFwCfgSelectItem(FwCfgItem);
+  QemuFwCfgReadBytes(sizeof(blobs), blobs);
+
+  for (i=0; i<MAX_VMFWUPD_ENTRIES; i++) {
+    blob = &blobs[i];
+
+    // first null entry terminates the processing loop
+    if (!blob->blob_type) {
+      return EFI_NOT_FOUND;
+    }
+
+    if (blob->blob_type == Blob->VmFwIdx) {
+        break;
+    }
+  }
+
+  /* TODO: Validate address ranges and map it as shared or copy */
+  /* TODO: In PEI phase, reserve ranges? */
+
+  Blob->Data = (VOID *)blob->paddr;
+  Blob->Size = blob->size;
+
+  DEBUG ((DEBUG_INFO, "XXX %a:%d Loaded %s at 0x%lx (len=0x%lx)\n",
+	  __func__, __LINE__, Blob->Name, blob->paddr, blob->size));
+
+  return EFI_SUCCESS;
+}
+
+
 /**
   Populate a blob in mKernelBlob.
 
@@ -941,7 +1030,15 @@ FetchBlob (
   UINT32  Left;
   UINTN   Idx;
   UINT8   *ChunkData;
+  EFI_STATUS   Status;
 
+  Status = FetchVmFwBlob(Blob);
+  if (!EFI_ERROR (Status)) {
+    return Status;
+  } else {
+    // fall back to old code here.
+    DEBUG ((DEBUG_INFO, "XXX Falling back to old logic here ..."));
+  }
   //
   // Read blob size.
   //
